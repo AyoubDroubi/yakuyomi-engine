@@ -2,6 +2,9 @@ package li.joye.yakuyomi.engine
 
 import android.util.Log
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -132,7 +135,34 @@ class LlmTranslator(
      * **脫掉思考參數重送一次**。代價＝該次請求用該模型的預設思考行為（可能較慢/較貴），
      * 但「能翻」遠優於「整章 400」。純參數協商、不改語意；只重試一次、避免無限退讓。
      */
+    /**
+     * One LLM call with rate-limit handling. Every call waits its turn at the process-wide [RateGate];
+     * an HTTP 429/503 slows the gate down for all pages and the call is retried (provider's retry delay
+     * when given, otherwise growing backoff). A used-up daily quota fails at once: retrying cannot help.
+     */
     private suspend fun request(messages: JSONArray): Pair<String, Usage?> {
+        var attempt = 0
+        while (true) {
+            RateGate.acquire()
+            try {
+                val result = requestWithThinkingFallback(messages)
+                RateGate.onSuccess()
+                return result
+            } catch (e: RateLimitedException) {
+                attempt++
+                if (e.daily) {
+                    throw RuntimeException("Daily quota for this model is used up (it resets once a day). ${e.message}", e)
+                }
+                if (attempt >= MAX_RATE_RETRIES) {
+                    throw RuntimeException("Still rate-limited after $attempt tries. ${e.message}", e)
+                }
+                Log.w(TAG, "rate-limited (try $attempt/$MAX_RATE_RETRIES), backing off: ${e.message}")
+                RateGate.onRateLimited(e.retryAfterMs)
+            }
+        }
+    }
+
+    private suspend fun requestWithThinkingFallback(messages: JSONArray): Pair<String, Usage?> {
         val key = "${cfg.provider}|${LlmProviders.migrateModel(cfg.provider, cfg.model)}"
         // 已知會拒的組合直接不送（否則整章每頁都先白花一次 400）。跨頁、跨引擎重建都記得。
         if (key in thinkingRejected) return requestOnce(messages, dropThinking = true)
@@ -176,7 +206,18 @@ class LlmTranslator(
             // ★帶上 provider 的 error body：這串會經 TranslateResult.error → Pipeline → PageTranslator
             //   落進每章的 .yakuyomi_errors.txt，400 的真正原因（例如 model 退役的「Model Not Exist」、
             //   402 餘額不足、401 key 錯）直接看得到，不再只有一個沒資訊的 "HTTP 400"。截 300 字免灌爆 log。
-            if (!resp.isSuccessful) throw RuntimeException("HTTP ${resp.code} ${text.take(300)}")
+            if (!resp.isSuccessful) {
+                // One line (provider bodies are multi-line JSON) so the error log stays readable.
+                val brief = text.take(300).replace(WS_RE, " ").trim()
+                if (resp.code == 429 || resp.code == 503) {
+                    throw RateLimitedException(
+                        "HTTP ${resp.code} $brief",
+                        retryAfterMs = parseRetryAfterMs(resp.header("Retry-After"), text),
+                        daily = resp.code == 429 && DAILY_QUOTA_RE.containsMatchIn(text),
+                    )
+                }
+                throw RuntimeException("HTTP ${resp.code} $brief")
+            }
             val obj = JSONObject(text)
             // 擷取 token 用量（非串流＝整包 usage 都在 body；缺欄/代理不回＝null、由呼叫端當未知）。
             val usage = obj.optJSONObject("usage")?.let { u ->
@@ -230,6 +271,19 @@ class LlmTranslator(
             return mentionsThinking && mentionsUnsupported
         }
         // 寬鬆解析：DeepSeek 偶爾吐格式變體（實測 <|1>| 管線跑到 > 後面、或 <|1>）。
+        /** Attempts per call before a rate-limited page is reported as failed. */
+        private const val MAX_RATE_RETRIES = 8
+        private val WS_RE = Regex("""\s+""")
+        /** Gemini names the exhausted quota, e.g. "GenerateRequestsPerDayPerProjectPerModel-FreeTier". */
+        private val DAILY_QUOTA_RE = Regex("""(?i)per\s*day""")
+        private val RETRY_DELAY_RE = Regex(""""retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"""")
+
+        /** Wait the provider asked for: `Retry-After` seconds, else Gemini's `retryDelay` in the body; null = unknown. */
+        internal fun parseRetryAfterMs(retryAfterHeader: String?, body: String): Long? {
+            retryAfterHeader?.trim()?.toLongOrNull()?.let { return it * 1000 }
+            return RETRY_DELAY_RE.find(body)?.groupValues?.get(1)?.toDoubleOrNull()?.let { (it * 1000).toLong() }
+        }
+
         // 只認「<、可選|、數字、一串 |/>、譯文」⇒ 容 <|1|> / <|1>| / <|1>，非決定性格式錯不再整頁失敗。
         private val LINE_RE = Regex("""^<\|?(\d+)\s*[|>]+\s*(.*)$""")
         private val THINK_RE = Regex("""(</think>)?<think>.*?</think>""", RegexOption.DOT_MATCHES_ALL)
@@ -260,5 +314,40 @@ class LlmTranslator(
                 "- Output each segment with its prefix (<|number|> format exactly) and only provide the translation without raw text.\n" +
                 "- Translate content only—no additional interpretation or commentary.\n" +
                 "Translate the following {from_lang}text into {to_lang}:\n"
+    }
+}
+
+/** HTTP 429/503 from the provider. [retryAfterMs]: the wait it asked for, if any; [daily]: the per-day quota ran out. */
+internal class RateLimitedException(message: String, val retryAfterMs: Long?, val daily: Boolean) : RuntimeException(message)
+
+/**
+ * Process-wide pacing for LLM calls, shared by every page and engine instance so concurrent pages back
+ * off together instead of each hitting the limit. Starts with no spacing; each rate limit doubles the
+ * gap between call starts (2 s up to 12 s) and pushes the next start past the provider's retry delay;
+ * each success shrinks the gap again, so pacing settles just under the provider's real limit.
+ */
+internal object RateGate {
+    private val mutex = Mutex()
+    private var nextStartMs = 0L   // guarded by mutex
+    private var spacingMs = 0L     // guarded by mutex
+
+    suspend fun acquire() {
+        val waitMs = mutex.withLock {
+            val now = System.currentTimeMillis()
+            val start = maxOf(now, nextStartMs)
+            nextStartMs = start + spacingMs
+            start - now
+        }
+        if (waitMs > 0) delay(waitMs)
+    }
+
+    suspend fun onRateLimited(retryAfterMs: Long?) = mutex.withLock {
+        spacingMs = if (spacingMs == 0L) 2_000L else (spacingMs * 2).coerceAtMost(12_000L)
+        val pause = (retryAfterMs ?: spacingMs).coerceIn(1_000L, 60_000L)
+        nextStartMs = maxOf(nextStartMs, System.currentTimeMillis() + pause)
+    }
+
+    suspend fun onSuccess() = mutex.withLock {
+        spacingMs = (spacingMs - 250L).coerceAtLeast(0L)
     }
 }

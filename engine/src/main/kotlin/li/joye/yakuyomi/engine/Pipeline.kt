@@ -165,10 +165,10 @@ class Pipeline(
             //  - error != null（例外〔網路/HTTP〕或部分解析）→ Failed：不標記、之後重試、整章變紅（呼叫端 drain 標 ERROR）。
             //  - error == null（LLM 正常全解析、但內容全被過濾，如整頁狀聲詞被原樣回 translated==source）→ Skipped：略過、不無限重試。
             return@coroutineScope if (llmError != null) {
-                PageResult.Failed("全數過濾(LLM 失敗 $llmError)｜回應=${llmRaw?.take(80)}")
+                PageResult.Failed("No text translated (LLM failed: $llmError) | response=${llmRaw?.take(80)}")
             } else {
                 PageResult.Skipped(
-                    "全數過濾 對齊$aligned/${textRegions.size}｜回應=$llmRaw｜$dbg",
+                    "No text kept (aligned $aligned/${textRegions.size}) | response=$llmRaw | $dbg",
                     PageStats(
                         lines.size, regions.size, 0, detectMs, ocrMs, translateMs, 0, 0,
                         promptTokens = promptTok, completionTokens = completionTok,
