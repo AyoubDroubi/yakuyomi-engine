@@ -45,7 +45,8 @@ object Renderer {
             val (fillColor, outlineColor) = textColors(page, region, cfg)
             fill.color = fillColor
             stroke.color = outlineColor
-            val vertical = when (cfg.orientation) {
+            // RTL scripts (Arabic, Hebrew…) are never typeset vertically: vertical stacking breaks letter joining.
+            val vertical = !isRtl(text) && when (cfg.orientation) {
                 TextOrientation.AUTO -> region.direction == "v" // 跟著偵測到的原文方向（對齊 m-i-t），不再無腦直排
                 TextOrientation.VERTICAL -> true
                 TextOrientation.HORIZONTAL -> false
@@ -100,6 +101,40 @@ object Renderer {
     private fun isCjk(text: String): Boolean = text.any {
         val o = it.code
         o in 0x3040..0x30FF || o in 0x4E00..0x9FFF || o in 0x3400..0x4DBF || o in 0xFF00..0xFFEF
+    }
+
+    /** True when the text contains right-to-left letters (Hebrew, Arabic and its supplements/presentation forms, Syriac, Thaana). */
+    internal fun isRtl(text: String): Boolean = text.any {
+        val o = it.code
+        o in 0x0590..0x08FF || o in 0xFB1D..0xFDFF || o in 0xFE70..0xFEFF
+    }
+
+    /**
+     * Script-aware line breaking. CJK may break between any two characters; everything else
+     * (Latin, Cyrillic, Arabic…) breaks only at spaces, so words — and Arabic letter joining —
+     * stay intact. A single word wider than the line falls back to per-character splitting.
+     */
+    internal fun wrapText(text: String, maxW: Float, measure: (String) -> Float): List<String> {
+        if (isCjk(text)) return wrapCjk(text, maxW, measure)
+        val lines = ArrayList<String>()
+        for (para in text.split('\n')) {
+            val words = para.split(' ').filter { it.isNotEmpty() }
+            if (words.isEmpty()) continue
+            val cur = StringBuilder()
+            for (word in words) {
+                val candidate = if (cur.isEmpty()) word else "$cur $word"
+                if (measure(candidate) <= maxW) { cur.setLength(0); cur.append(candidate); continue }
+                if (cur.isNotEmpty()) { lines.add(cur.toString()); cur.setLength(0) }
+                if (measure(word) <= maxW) {
+                    cur.append(word)
+                } else { // overlong single word: hard-split by character
+                    val pieces = wrapCjk(word, maxW, measure)
+                    lines.addAll(pieces.dropLast(1)); cur.append(pieces.last())
+                }
+            }
+            if (cur.isNotEmpty()) lines.add(cur.toString())
+        }
+        return lines.ifEmpty { listOf(text) }
     }
 
     /** 直排：欄右→左、格上→下、向上對齊；大小填滿放大後的文字框、每欄少 colTrim 格。每格＝1 字或 1 個縱中橫短串。 */
@@ -205,24 +240,31 @@ object Renderer {
     private fun drawHorizontal(canvas: Canvas, x0: Float, y0: Float, x1: Float, y1: Float, text: String, fill: Paint, stroke: Paint, cfg: RenderConfig, onArt: Boolean = false) {
         val bw = (x1 - x0) * cfg.expandW
         val rowRoom = (y1 - y0) * cfg.expandH
+        val rtl = isRtl(text)
+        // Arabic glyphs sit taller (dots/diacritics above and below the line): give rows more room.
+        val lineFactor = if (rtl) RTL_LINE_FACTOR else 1.18f
+        val measure: (String) -> Float = { fill.measureText(it) }
         var size = cfg.fontSizeMin
         var lines = listOf(text)
         var s = min(rowRoom.toInt(), cfg.fontSizeMax)
         while (s >= cfg.fontSizeMin) {
             fill.textSize = s.toFloat()
-            val ls = wrapCjk(text, fill, (bw - cfg.rowTrim * s).coerceAtLeast(s.toFloat())) // 每行少 rowTrim 字（橫向字數）
+            val ls = wrapText(text, (bw - cfg.rowTrim * s).coerceAtLeast(s.toFloat()), measure) // 每行少 rowTrim 字（橫向字數）
             val maxW = ls.maxOfOrNull { fill.measureText(it) } ?: 0f
-            if (ls.size * s * 1.18f <= rowRoom && maxW <= bw) { size = s; lines = ls; break }
+            if (ls.size * s * lineFactor <= rowRoom && maxW <= bw) { size = s; lines = ls; break }
             s--
         }
         size = maxOf(cfg.fontSizeMin, (size * cfg.fontScale).roundToInt())  // 整體縮小、更 fit
         fill.textSize = size.toFloat(); stroke.textSize = size.toFloat()
         stroke.strokeWidth = maxOf(2f, size * (if (onArt) cfg.artStrokeRatio else STROKE_RATIO))  // 描邊隨字級；壓畫面區用更粗白邊
-        lines = wrapCjk(text, fill, (bw - cfg.rowTrim * size).coerceAtLeast(size.toFloat()))  // 縮小後重排（含 rowTrim）
-        val lh = size * 1.18f
+        lines = wrapText(text, (bw - cfg.rowTrim * size).coerceAtLeast(size.toFloat()), measure)  // 縮小後重排（含 rowTrim）
+        val lh = size * lineFactor
         val tcx = (x0 + x1) / 2f
         var baseline = (y0 + y1) / 2f - lines.size * lh / 2f + size * ASCENT  // 垂直置中於框
-        for (ln in lines) {
+        for (raw in lines) {
+            // A leading RIGHT-TO-LEFT MARK makes the line an RTL paragraph, so "!", "..." or digits at
+            // either end land on the correct side. Canvas.drawText itself does the Arabic shaping + bidi.
+            val ln = if (rtl) RLM + raw else raw
             val tx = tcx - fill.measureText(ln) / 2f
             if (cfg.fontBorder) canvas.drawText(ln, tx, baseline, stroke)
             canvas.drawText(ln, tx, baseline, fill)
@@ -242,12 +284,12 @@ object Renderer {
         if (rotate) canvas.restore()
     }
 
-    private fun wrapCjk(text: String, paint: Paint, maxW: Float): List<String> {
+    private fun wrapCjk(text: String, maxW: Float, measure: (String) -> Float): List<String> {
         val lines = ArrayList<String>()
         val cur = StringBuilder()
         for (ch in text) {
             if (ch == '\n') { lines.add(cur.toString()); cur.clear(); continue }
-            if (cur.isNotEmpty() && paint.measureText(cur.toString() + ch) > maxW && ch !in NO_START) {
+            if (cur.isNotEmpty() && measure(cur.toString() + ch) > maxW && ch !in NO_START) {
                 lines.add(cur.toString()); cur.clear()  // 行頭禁則：禁則字不另起行
             }
             cur.append(ch)
@@ -256,6 +298,8 @@ object Renderer {
         return lines
     }
 
+    private const val RLM = "‏"         // RIGHT-TO-LEFT MARK
+    private const val RTL_LINE_FACTOR = 1.45f
     private const val ASCENT = 0.82f
     private const val STROKE_RATIO = 0.10f  // 描邊寬＝字級×此比例（隨字級縮放）
     private const val MAX_TCY = 4  // 縱中橫一格最多併幾個 ASCII（涵蓋 2 位數年齡、4 位數年份；更長退回逐字避免壓太扁）
