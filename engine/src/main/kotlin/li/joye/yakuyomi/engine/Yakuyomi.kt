@@ -40,6 +40,8 @@ object Yakuyomi {
         apiKey: String?,
         config: EngineConfig = EngineConfig(),
         typeface: Typeface? = null,
+        /** Use this translator instead of the cloud LLM (for example an on-device model); [apiKey] is then unused. */
+        translator: Translator? = null,
     ): TranslationEngine {
         // 三顆模型（偵測／OCR／去字）全 NCNN（產品 arm64、NCNN 必在；ORT 已整個從引擎拔除、LaMa 退役）。
         check(NcnnBackend.available) { "NCNN 原生庫未載入（arm64 應可用）" }
@@ -50,9 +52,9 @@ object Yakuyomi {
         // 去字兩門別（boxfill/aot）皆用同一顆 NCNN AOT 模型（boxfill 只平塗不跑它、但仍要載得起來）。
         EngineTrace.log("create.inpainter")
         val inpainter = Inpainter(models.aotInpainterNcnn ?: error("需 NCNN AOT 去字模型（.param）"), config.inpainter)
-        val translator = apiKey?.takeIf { it.isNotBlank() }?.let { LlmTranslator(it, config.translator) }
+        val tr = translator ?: apiKey?.takeIf { it.isNotBlank() }?.let { LlmTranslator(it, config.translator) }
         EngineTrace.log("create.done")
-        return Pipeline(detector, ocr, translator, inpainter, config, typeface)
+        return Pipeline(detector, ocr, tr, inpainter, config, typeface)
     }
 
     /** 這顆 CPU 有 fp16 storage/arithmetic（arm82 asimdhp）——決定 OCR 能不能用混合精度 param（見 [Ocr]、[OcrConfig.ncnnMixed]）。 */

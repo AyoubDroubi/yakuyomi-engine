@@ -265,8 +265,8 @@ class Pipeline(
         val t0 = System.currentTimeMillis()
         val tr = translator
         if (tr == null) return BatchTranslation(pages.map { PageTranslation(it) }, 0, false) // debug: typeset source
-        val llm = tr as? LlmTranslator
-        if (llm != null) return llm.translatePages(pages)
+        val batch = tr as? BatchTranslator
+        if (batch != null) return batch.translatePages(pages)
         val out = pages.map { q ->
             try {
                 PageTranslation(tr.translate(q))
@@ -343,6 +343,7 @@ class Pipeline(
 
     /** 釋放 detector/ocr/inpainter 的原生 ONNX session（見類別說明的生命週期注意事項）。 */
     override fun close() {
+        runCatching { (translator as? AutoCloseable)?.close() }
         runCatching { detector.close() }
         runCatching { ocr.close() }
         runCatching { inpainter.close() }

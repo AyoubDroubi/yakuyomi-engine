@@ -31,7 +31,7 @@ class LlmTranslator(
     private val apiKey: String,
     private val cfg: TranslatorConfig = TranslatorConfig(),
     private val postProcess: ((String) -> String)? = null,
-) : Translator {
+) : BatchTranslator {
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -85,7 +85,7 @@ class LlmTranslator(
      * sees one conversation across the pages) and split back per page. A failed request fails every page of the
      * batch with the same error (a used-up daily quota keeps its marker text, so the app can pause its queue).
      */
-    suspend fun translatePages(pages: List<List<String>>): BatchTranslation {
+    override suspend fun translatePages(pages: List<List<String>>): BatchTranslation {
         if (pages.isEmpty()) return BatchTranslation(emptyList(), 0, false)
         val flat = pages.flatten()
         val t0 = System.currentTimeMillis()
