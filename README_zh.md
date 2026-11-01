@@ -1,5 +1,7 @@
 # Yakuyomi — 漫畫翻譯引擎
 
+> **本 repo 是 [Karaza](https://github.com/AyoubDroubi/Karaza) 使用的翻譯引擎**，fork 自 [joyeli/yakuyomi-engine](https://github.com/joyeli/yakuyomi-engine)（GPL-3.0），加入阿拉伯文／由右至左支援等修改（見 git 歷史）。App 請到 Karaza repo 取得。以下為原專案的說明。
+
 偵測、OCR、去字都在裝置上跑（全 NCNN），翻譯走雲端 LLM。預設日文翻繁體中文，來源與目標語言都可改。
 
 [English](README.md) ｜ 中文

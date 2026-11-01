@@ -82,6 +82,10 @@ class Inpainter(
         }
     }
 
+    /** The exact pixels [inpaint] would change for [regions] (ARGB, white = changed), as a [w]×[h] row-major array. */
+    internal fun maskPixels(regions: List<TextRegion>, textMask: Bitmap, w: Int, h: Int): IntArray =
+        buildSegMask(regions, textMask, w, h)
+
     /** 去字遮罩 Bitmap（白＝要去字）。給重繪素材/視覺化用；與 inpaint 同一份 seg 細遮罩。 */
     fun buildMask(page: Bitmap, regions: List<TextRegion>, textMask: Bitmap): Bitmap {
         val w = page.width; val h = page.height

@@ -192,7 +192,10 @@ class Pipeline(
 
         if (failed.isNotEmpty()) {
             val margin = cfg.inpainter.bboxPad + (cfg.inpainter.maskDilate / 2f).toInt() + 2
-            OriginalRestore.restore(cleaned, page, failed.map { it.rect(margin) }, kept.map { it.rect(margin) })
+            // Protect only the pixels the translated regions' own inpainting changed, so a failed bubble next to a
+            // translated one gets all of its artwork back.
+            val keptMask = inpainter.maskPixels(kept, detection.textMask, page.width, page.height)
+            OriginalRestore.restore(cleaned, page, failed.map { it.rect(margin) }, keptMask)
         }
 
         // Typeset only the translated regions; failed ones show the original artwork restored above.

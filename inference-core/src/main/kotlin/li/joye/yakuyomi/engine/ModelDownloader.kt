@@ -40,9 +40,12 @@ sealed interface ModelProgress {
  */
 object ModelDownloader {
 
-    /** 預設 manifest 位置（引擎 repo 公開後生效；reader 可覆寫成 release 資產或自架）。 */
+    /**
+     * Default manifest location. Apps should prefer a manifest bundled in the APK ([parseManifest]): then the file
+     * list and sha256 values are pinned at build time and nobody controlling a remote file can swap the models.
+     */
     const val DEFAULT_MANIFEST_URL =
-        "https://raw.githubusercontent.com/joyeli/yakuyomi-engine/main/models.json"
+        "https://raw.githubusercontent.com/AyoubDroubi/yakuyomi-engine/main/models.json"
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(30, TimeUnit.SECONDS)
@@ -60,8 +63,8 @@ object ModelDownloader {
             }
         }
 
-    /** 解析 models.json（`{ version, models: [{role,name,url,size,sha256,...}] }`）。只給 [fetchManifest] 用。 */
-    private fun parseManifest(json: String): List<RemoteModel> {
+    /** Parses models.json (`{ version, models: [{role,name,url,size,sha256,...}] }`). */
+    fun parseManifest(json: String): List<RemoteModel> {
         val arr = JSONObject(json).getJSONArray("models")
         return (0 until arr.length()).map {
             val m = arr.getJSONObject(it)
@@ -86,8 +89,14 @@ object ModelDownloader {
     ): Map<String, File> = withContext(Dispatchers.IO) {
         if (!destDir.exists()) destDir.mkdirs()
         val out = LinkedHashMap<String, File>()
+        val root = destDir.canonicalFile
         for (m in models) {
-            val file = File(destDir, m.name)
+            // A model name is a plain file name: anything that could leave destDir ("../x", "a/b") is rejected.
+            require(m.name.isNotBlank() && m.name.none { it == '/' || it == '\\' } && m.name != "." && m.name != "..") {
+                "Invalid model file name: ${m.name}"
+            }
+            val file = File(root, m.name)
+            require(file.canonicalFile.parentFile == root) { "Invalid model file name: ${m.name}" }
             if (file.exists() && file.length() == m.size && sha256(file) == m.sha256) {
                 onProgress(ModelProgress.Done(m.role, m.name)) // 已是正確版本
                 out[m.role] = file
@@ -99,7 +108,7 @@ object ModelDownloader {
                 val got = sha256(file)
                 if (got != m.sha256) {
                     file.delete()
-                    throw RuntimeException("sha256 不符（期望 ${m.sha256.take(12)}…，實得 ${got.take(12)}…）")
+                    throw RuntimeException("sha256 mismatch (expected ${m.sha256.take(12)}…, got ${got.take(12)}…)")
                 }
                 onProgress(ModelProgress.Done(m.role, m.name))
                 out[m.role] = file

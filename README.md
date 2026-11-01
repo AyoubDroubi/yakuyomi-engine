@@ -1,12 +1,16 @@
 # Yakuyomi — manga translation engine
 
+> **This is the translation engine of [Karaza](https://github.com/AyoubDroubi/Karaza)**, a fork of
+> [joyeli/yakuyomi-engine](https://github.com/joyeli/yakuyomi-engine) (GPL-3.0) with Arabic / right-to-left support and other
+> changes (see the git history). Get the app from the Karaza repository. The text below is the original project's README.
+
 On-device detection, OCR and text removal (all on NCNN), plus cloud-LLM translation. Japanese to Traditional Chinese by default; any source and target language can be set.
 
 English ｜ [中文](README_zh.md)
 
 Status: the full pipeline runs on-device and drives the Yakuyomi reader app — translate-on-download, read-as-you-go live translation, and cheap re-rendering all work. The reader's [first public release](https://github.com/joyeli/Yakuyomi/releases/latest) is out.
 
-This repo is the **engine** (`yakuyomi-engine`) — the translation library, not an installable app. **Want the app?** It's the reader, **Yakuyomi**, a [mihon](https://github.com/mihonapp/mihon) fork: [**download the signed APK**](https://github.com/joyeli/Yakuyomi/releases/latest) or see its [repo](https://github.com/joyeli/Yakuyomi). This engine repo pulls into it as a submodule; see [Repository layout](#repository-layout).
+This repo is the **engine** (`yakuyomi-engine`) — the translation library, not an installable app. **Want the app?** It's [**Karaza**](https://github.com/AyoubDroubi/Karaza) (based on the original reader, [Yakuyomi](https://github.com/joyeli/Yakuyomi), a [mihon](https://github.com/mihonapp/mihon) fork). This engine repo pulls into it as a submodule; see [Repository layout](#repository-layout).
 
 ## Where to start
 

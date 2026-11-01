@@ -36,4 +36,9 @@ class JoinOcrLinesTest {
     @Test fun latinNextToKanaHasNoSpace() {
         assertEquals("OKです", joinOcrLines(listOf("OK", "です")))
     }
+
+    @Test fun japaneseRegionKeepsEllipsesAndDigitsTight() {
+        assertEquals("そんな……ばかな", joinOcrLines(listOf("そんな…", "…ばかな")))
+        assertEquals("第12話", joinOcrLines(listOf("第1", "2話")))
+    }
 }

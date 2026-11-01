@@ -3,9 +3,7 @@ package li.joye.yakuyomi.engine
 import android.graphics.Bitmap
 
 /** Integer pixel rectangle, [x0, x1) × [y0, y1). */
-internal data class PixelRect(val x0: Int, val y0: Int, val x1: Int, val y1: Int) {
-    fun contains(x: Int, y: Int) = x in x0 until x1 && y in y0 until y1
-}
+internal data class PixelRect(val x0: Int, val y0: Int, val x1: Int, val y1: Int)
 
 /** The region's bounding box grown by [margin] px on every side. */
 internal fun TextRegion.rect(margin: Int) = PixelRect(
@@ -19,23 +17,24 @@ internal fun TextRegion.rect(margin: Int) = PixelRect(
  * Puts the original artwork back over regions whose translation failed. Inpainting runs on every text region in
  * parallel with translation (before it is known which ones will fail) and only touches pixels inside each region's
  * box grown by the mask padding and dilation, so copying those boxes back from the original undoes it. Pixels that
- * also fall inside a translated region's box are left alone, so a neighbouring translated bubble stays clean.
+ * the translated regions' own inpaint mask covers are left alone, so a neighbouring translated bubble stays clean.
  */
 internal object OriginalRestore {
 
-    fun restore(cleaned: Bitmap, original: Bitmap, restore: List<PixelRect>, protect: List<PixelRect>) {
+    /** [protectMask]: ARGB pixels of the page, white = belongs to a translated region's inpainting (keep cleaned). */
+    fun restore(cleaned: Bitmap, original: Bitmap, restore: List<PixelRect>, protectMask: IntArray) {
         if (restore.isEmpty()) return
         val w = cleaned.width
         val h = cleaned.height
-        if (original.width != w || original.height != h || !cleaned.isMutable) return
+        if (original.width != w || original.height != h || !cleaned.isMutable || protectMask.size != w * h) return
         val dst = IntArray(w * h).also { cleaned.getPixels(it, 0, w, 0, 0, w, h) }
         val src = IntArray(w * h).also { original.getPixels(it, 0, w, 0, 0, w, h) }
-        copyBack(dst, src, w, h, restore, protect)
+        copyBack(dst, src, w, h, restore, protectMask)
         cleaned.setPixels(dst, 0, w, 0, 0, w, h)
     }
 
     /** Pure pixel step of [restore] (row-major ARGB arrays of [w]×[h]); separate so it can be unit-tested on the JVM. */
-    fun copyBack(dst: IntArray, src: IntArray, w: Int, h: Int, restore: List<PixelRect>, protect: List<PixelRect>) {
+    fun copyBack(dst: IntArray, src: IntArray, w: Int, h: Int, restore: List<PixelRect>, protectMask: IntArray?) {
         for (r in restore) {
             val x0 = r.x0.coerceIn(0, w)
             val x1 = r.x1.coerceIn(0, w)
@@ -44,8 +43,9 @@ internal object OriginalRestore {
             for (y in y0 until y1) {
                 val row = y * w
                 for (x in x0 until x1) {
-                    if (protect.any { it.contains(x, y) }) continue
-                    dst[row + x] = src[row + x]
+                    val i = row + x
+                    if (protectMask != null && (protectMask[i] and 0xFF) > 127) continue
+                    dst[i] = src[i]
                 }
             }
         }

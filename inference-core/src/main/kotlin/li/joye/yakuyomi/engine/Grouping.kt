@@ -55,12 +55,17 @@ class TextRegion(
 }
 
 /**
- * Join the OCR lines of one region. Chinese and Japanese are written without spaces, so their lines are concatenated;
- * every other script (English, Korean, ...) needs a space at the line break, otherwise "IT WOULD BE A" + "WASTE"
+ * Join the OCR lines of one region. Chinese and Japanese are written without spaces, so a region containing Han or
+ * kana is concatenated as before; every other script (English, Korean, ...) needs a space at the line break, otherwise "IT WOULD BE A" + "WASTE"
  * reaches the translator as "AWASTE". A line ending in a hyphen after a letter is a word split across lines and is
  * joined without a space. Blank lines (dropped low-confidence OCR) are skipped.
  */
 fun joinOcrLines(parts: List<String>): String {
+    // A region with any Han or kana is Chinese/Japanese: keep the old tight join for every break (so "…" + "…" or
+    // "1" + "2" stay "……" / "12" there). Otherwise decide per line break.
+    if (parts.any { p -> p.any { isNoSpaceScript(it) && !it.isWhitespace() } }) {
+        return parts.joinToString("") { it.trim() }
+    }
     val sb = StringBuilder()
     for (raw in parts) {
         val part = raw.trim()

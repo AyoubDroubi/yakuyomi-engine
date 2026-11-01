@@ -71,10 +71,14 @@ class LlmTranslator(
             val (raw, firstUsage) = request(buildMessages(queries))
             val parsed = parse(raw).toMutableMap()
             var usage = firstUsage
-            // Lines the model skipped or left empty get one more request with just those lines, so a dropped line
-            // does not leave its bubble untranslated. A used-up daily quota during that request fails the whole page
-            // (it is retried later) instead of keeping a page with a hole in it; other errors keep the first answer.
-            val missing = queries.indices.filter { parsed[it + 1].isNullOrBlank() }
+            // Lines the model dropped (number absent) or left empty although they contain words get one more request
+            // with just those lines, so a dropped line does not leave its bubble untranslated. An empty answer for a
+            // line without words ("…", "!?") is fine and not retried. A used-up daily quota during that request fails
+            // the whole page (it is retried later) instead of keeping a page with a hole; other errors keep the first answer.
+            val missing = queries.indices.filter { i ->
+                val got = parsed[i + 1]
+                got == null || (got.isBlank() && queries[i].count { it.isLetter() } >= 2)
+            }
             if (missing.isNotEmpty()) {
                 try {
                     val (raw2, usage2) = request(buildMessages(missing.map { queries[it] }))
@@ -86,8 +90,10 @@ class LlmTranslator(
                     Log.w(TAG, "Retry of ${missing.size} missing lines failed: ${t.message}")
                 }
             }
-            val got = queries.indices.count { !parsed[it + 1].isNullOrBlank() }
-            val error = if (got < queries.size) "Parsed $got/${queries.size} lines" else null
+            // Same rule as before the retry existed: a line the model answered, even with an empty line, counts as
+            // parsed; only absent numbers make it a parse error (which turns an all-filtered page into Failed).
+            val answered = queries.indices.count { parsed[it + 1] != null }
+            val error = if (answered < queries.size) "Parsed $answered/${queries.size} lines" else null
             val translations = queries.mapIndexed { i, q ->
                 val tr = parsed[i + 1]?.takeIf { it.isNotBlank() }
                 if (tr != null) (postProcess?.invoke(tr) ?: tr) else q
@@ -298,7 +304,7 @@ class LlmTranslator(
         private const val MAX_RATE_RETRIES = 8
         private val WS_RE = Regex("""\s+""")
         /** Gemini names the exhausted quota, e.g. "GenerateRequestsPerDayPerProjectPerModel-FreeTier". */
-        private val DAILY_QUOTA_RE = Regex("""(?i)per\s*day""")
+        private val DAILY_QUOTA_RE = Regex("""(?i)per[\s_-]*day""")
 
         /** Start of the error for a used-up daily quota; the app matches on it to pause its queue. */
         const val DAILY_QUOTA_MESSAGE = "Daily quota for this model is used up"

@@ -19,7 +19,7 @@ data class ModelInfo(val id: String, val name: String)
  *
  * 兩種來源（[ModelSource]）：
  *  - OPENAI：`GET {modelsUrl}` 帶 `Authorization: Bearer` → `data[].id`（涵蓋 11+ OpenAI 相容 provider）。
- *  - GEMINI：`GET {modelsUrl}?key=` → `models[]` 濾 `generateContent` → name 去 `models/` 前綴。
+ *  - GEMINI：`GET {modelsUrl}` (key in the x-goog-api-key header) → `models[]` 濾 `generateContent` → name 去 `models/` 前綴。
  */
 object LlmModels {
 
@@ -89,8 +89,9 @@ object LlmModels {
     /** Gemini native：`models[]` 濾 `generateContent`、name 去 `models/`。 */
     private fun fetchGemini(url: String, apiKey: String): List<ModelInfo> {
         val sep = if (url.contains("?")) "&" else "?"
-        val full = "$url${sep}key=$apiKey&pageSize=1000"
-        val req = Request.Builder().url(full).get().build()
+        // Key in a header, not the query string, so it never shows up in URLs (logs, proxies, error messages).
+        val full = "$url${sep}pageSize=1000"
+        val req = Request.Builder().url(full).header("x-goog-api-key", apiKey).get().build()
         client.newCall(req).execute().use { resp ->
             val text = resp.body.string()
             if (!resp.isSuccessful) throw RuntimeException("HTTP ${resp.code} ${text.take(300)}")
