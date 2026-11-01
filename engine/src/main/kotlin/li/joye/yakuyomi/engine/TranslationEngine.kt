@@ -27,6 +27,18 @@ interface TranslationEngine : AutoCloseable {
      */
     suspend fun translatePage(page: Bitmap): PageResult
 
+    /** Batch step 1 (see Batch.kt): detection + OCR of [page]; does not keep or recycle the bitmap. */
+    suspend fun prepare(page: Bitmap): PrepareResult
+
+    /** Batch step 2: translate the [pages] (each a list of lines) in one request where the translator supports it. */
+    suspend fun translateBatch(pages: List<List<String>>): BatchTranslation
+
+    /**
+     * Batch step 3: finish [prepared] with its [translation] on [page] (the same page decoded again). Same result
+     * shapes as [translatePage]; does not recycle [page].
+     */
+    suspend fun complete(page: Bitmap, prepared: PreparedPage, translation: PageTranslation): PageResult
+
     /**
      * 單緒暖機：對每個原生 session（detector / OCR / 去字）各空跑一次推論，完成首次 lazy 初始化（權重預處理 / arena 配置等）。
      * **併發翻多頁前先呼叫一次**（單緒）——否則多頁同時打進「剛載好、還沒推論過」的冷 session 會撞首次初始化的 race → 原生 crash。

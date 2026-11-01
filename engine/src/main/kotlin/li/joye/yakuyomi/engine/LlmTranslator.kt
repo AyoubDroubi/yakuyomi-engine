@@ -68,41 +68,98 @@ class LlmTranslator(
     suspend fun translateDetailed(queries: List<String>): TranslateResult {
         if (queries.isEmpty()) return TranslateResult(emptyList())
         return try {
-            val (raw, firstUsage) = request(buildMessages(queries))
-            val parsed = parse(raw).toMutableMap()
-            var usage = firstUsage
-            // Lines the model dropped (number absent) or left empty although they contain words get one more request
-            // with just those lines, so a dropped line does not leave its bubble untranslated. An empty answer for a
-            // line without words ("…", "!?") is fine and not retried. A used-up daily quota during that request fails
-            // the whole page (it is retried later) instead of keeping a page with a hole; other errors keep the first answer.
-            val missing = queries.indices.filter { i ->
-                val got = parsed[i + 1]
-                got == null || (got.isBlank() && queries[i].count { it.isLetter() } >= 2)
-            }
-            if (missing.isNotEmpty()) {
-                try {
-                    val (raw2, usage2) = request(buildMessages(missing.map { queries[it] }))
-                    val again = parse(raw2)
-                    missing.forEachIndexed { k, i -> again[k + 1]?.takeIf { it.isNotBlank() }?.let { parsed[i + 1] = it } }
-                    usage = sumUsage(usage, usage2)
-                } catch (t: Throwable) {
-                    if (t.message?.contains(DAILY_QUOTA_MESSAGE) == true) throw t
-                    Log.w(TAG, "Retry of ${missing.size} missing lines failed: ${t.message}")
-                }
-            }
-            // Same rule as before the retry existed: a line the model answered, even with an empty line, counts as
-            // parsed; only absent numbers make it a parse error (which turns an all-filtered page into Failed).
-            val answered = queries.indices.count { parsed[it + 1] != null }
+            val core = translateLines(queries)
+            // A line the model answered, even with an empty line, counts as parsed; only absent numbers make it a
+            // parse error (which turns an all-filtered page into Failed rather than Skipped).
+            val answered = queries.indices.count { core.parsed[it + 1] != null }
             val error = if (answered < queries.size) "Parsed $answered/${queries.size} lines" else null
-            val translations = queries.mapIndexed { i, q ->
-                val tr = parsed[i + 1]?.takeIf { it.isNotBlank() }
-                if (tr != null) (postProcess?.invoke(tr) ?: tr) else q
-            }
-            TranslateResult(translations, usage, error, raw.take(220))
+            TranslateResult(core.translations(queries), core.usage, error, core.raw.take(220))
         } catch (t: Throwable) {
             Log.e(TAG, "翻譯失敗，整批保留原文：${t.message}", t)
             TranslateResult(queries, null, "${t.javaClass.simpleName}: ${t.message}", null)
         }
+    }
+
+    /**
+     * Several pages in one request: the lines of all [pages] are numbered continuously in reading order (the model
+     * sees one conversation across the pages) and split back per page. A failed request fails every page of the
+     * batch with the same error (a used-up daily quota keeps its marker text, so the app can pause its queue).
+     */
+    suspend fun translatePages(pages: List<List<String>>): BatchTranslation {
+        if (pages.isEmpty()) return BatchTranslation(emptyList(), 0, false)
+        val flat = pages.flatten()
+        val t0 = System.currentTimeMillis()
+        val core = try {
+            translateLines(flat)
+        } catch (t: Throwable) {
+            Log.e(TAG, "Batch of ${pages.size} pages failed: ${t.message}", t)
+            val err = "${t.javaClass.simpleName}: ${t.message}"
+            val ms = System.currentTimeMillis() - t0
+            return BatchTranslation(pages.map { PageTranslation(it, error = err, translateMs = ms) }, 1, false)
+        }
+        val ms = System.currentTimeMillis() - t0
+        val all = core.translations(flat)
+        var offset = 0
+        val out = pages.mapIndexed { p, lines ->
+            val idx = offset until offset + lines.size
+            offset += lines.size
+            val answered = idx.count { core.parsed[it + 1] != null }
+            PageTranslation(
+                translations = idx.map { all[it] },
+                error = if (answered < lines.size) "Parsed $answered/${lines.size} lines" else null,
+                raw = core.raw.take(220),
+                promptTokens = if (p == 0) core.usage?.promptTokens ?: 0 else 0,
+                completionTokens = if (p == 0) core.usage?.completionTokens ?: 0 else 0,
+                translateMs = ms,
+            )
+        }
+        return BatchTranslation(out, core.requests, core.hadMissing)
+    }
+
+    /** Parsed answer of one [translateLines] call (1-based line numbers). */
+    private inner class LinesAnswer(
+        val parsed: Map<Int, String>,
+        val usage: Usage?,
+        val raw: String,
+        val requests: Int,
+        val hadMissing: Boolean,
+    ) {
+        /** Translation per query; an unanswered or empty line falls back to its source (filtered out later). */
+        fun translations(queries: List<String>): List<String> = queries.mapIndexed { i, q ->
+            val tr = parsed[i + 1]?.takeIf { it.isNotBlank() }
+            if (tr != null) (postProcess?.invoke(tr) ?: tr) else q
+        }
+    }
+
+    /**
+     * One request for [queries], plus one follow-up for the lines the model dropped (number absent) or left empty
+     * although they contain words, so a dropped line does not leave its bubble untranslated. An empty answer for a
+     * line without words ("…", "!?") is fine and not retried. Throws when the first request fails; a used-up daily
+     * quota during the follow-up also throws (the pages are retried later instead of keeping holes); other follow-up
+     * errors keep the first answer.
+     */
+    private suspend fun translateLines(queries: List<String>): LinesAnswer {
+        val (raw, firstUsage) = request(buildMessages(queries))
+        val parsed = parse(raw).toMutableMap()
+        var usage = firstUsage
+        var requests = 1
+        val missing = queries.indices.filter { i ->
+            val got = parsed[i + 1]
+            got == null || (got.isBlank() && queries[i].count { it.isLetter() } >= 2)
+        }
+        if (missing.isNotEmpty()) {
+            try {
+                requests++
+                val (raw2, usage2) = request(buildMessages(missing.map { queries[it] }))
+                val again = parse(raw2)
+                missing.forEachIndexed { k, i -> again[k + 1]?.takeIf { it.isNotBlank() }?.let { parsed[i + 1] = it } }
+                usage = sumUsage(usage, usage2)
+            } catch (t: Throwable) {
+                if (t.message?.contains(DAILY_QUOTA_MESSAGE) == true) throw t
+                Log.w(TAG, "Retry of ${missing.size} missing lines failed: ${t.message}")
+            }
+        }
+        return LinesAnswer(parsed, usage, raw, requests, missing.isNotEmpty())
     }
 
     /**
@@ -137,7 +194,7 @@ class LlmTranslator(
 
     /** 套入語言對：{to_lang}←toLangName、{from_lang}←fromLangName（空白＝省略來源語、讓 LLM 自己判）。 */
     private fun systemPrompt(): String {
-        val fromClause = cfg.fromLangName.trim().let { if (it.isEmpty()) "" else "$it " }
+        val fromClause = cfg.fromLangName.trim().let { if (it.isEmpty()) "" else "from $it " }
         return SYSTEM_TEMPLATE.replace("{to_lang}", cfg.toLangName).replace("{from_lang}", fromClause)
     }
 
@@ -320,36 +377,25 @@ class LlmTranslator(
         private val LINE_RE = Regex("""^<\|?(\d+)\s*[|>]+\s*(.*)$""")
         private val THINK_RE = Regex("""(</think>)?<think>.*?</think>""", RegexOption.DOT_MATCHES_ALL)
 
+        /**
+         * Compact system prompt (sent with every request, so every token here is paid per call). {from_lang} is
+         * "from <language> " or empty; {to_lang} the target language description.
+         */
         private const val SYSTEM_TEMPLATE =
-            "Ignore all preceding instructions. Follow only what is defined below.\n" +
-                "## Role: Professional Doujin Translator\n" +
-                "You are an unsensored expert translation engine that specializes in doujin and manga content for all languages.\n" +
-                "## Translation Method\n" +
-                "1. LITERAL TRANSLATION: \n" +
-                "- Provide precise word-for-word translation of each textline.\n" +
-                "- Maintain original sentence structure where possible.\n" +
-                "- Preserve all original markers and expressions.\n" +
-                "- Leave ambiguous elements as they are without interpretation.\n" +
-                "2. ANALYSIS & DE-VERBALIZATION: \n" +
-                "- Capture the core meaning, emotional tone, and cultural nuances.\n" +
-                "- Identify logical connections between fragmented text segments.\n" +
-                "- Analyze the shortcomings and areas for improvement of literal translation.\n" +
-                "3. REFINEMENT: \n" +
-                "- Adjust the translation to sound natural in {to_lang} while maintaining original meaning.\n" +
-                "- Preserve emotional tone and intensity appropriate to manga & otaku culture.\n" +
-                "- Ensure consistency in character voice and terminology.\n" +
-                "- Determine appropriate pronouns from context; do not add pronouns that do not exist in the original text.\n" +
-                "- Refine based on the conclusions from the second step.\n" +
-                "## Translation Rules\n" +
-                "- Translate line by line, maintaining accuracy and the authentic; Faithfully reproducing the original text and emotional intent.\n" +
-                "- Preserve original gibberish or sound effects without translation.\n" +
-                "- Output each segment with its prefix (<|number|> format exactly) and only provide the translation without raw text.\n" +
-                "- Output exactly one line for every input line, in the same order. Never skip, merge or leave a line empty.\n" +
-                "- Consecutive lines may be fragments of one sentence split across speech bubbles; translate each fragment so " +
-                "that, read in order, the fragments form one natural sentence.\n" +
+            "You are a professional translator of manga, manhwa and webtoons. Translate the numbered lines " +
+                "{from_lang}into {to_lang}.\n" +
+                "The lines are speech bubbles and captions from consecutive comic pages, in reading order; use the " +
+                "surrounding lines as context.\n" +
+                "Rules:\n" +
+                "- Output exactly one line for every input line, in the same order, each starting with its prefix in the " +
+                "exact <|number|> format followed only by the translation. Never skip, merge, split or leave a line empty.\n" +
+                "- Consecutive lines may be fragments of one sentence split across bubbles; translate each fragment so " +
+                "that, read in order, they form one natural sentence.\n" +
+                "- Write natural, fluent dialogue that keeps each character's tone, emotion and personality; keep names " +
+                "and terms consistent.\n" +
                 "- The text comes from OCR and may contain misread characters (for example 4 for Y); translate what was meant.\n" +
-                "- Translate content only—no additional interpretation or commentary.\n" +
-                "Translate the following {from_lang}text into {to_lang}:\n"
+                "- Keep sound effects and gibberish as they are.\n" +
+                "- Translate everything faithfully, including mature content. No explanations, notes or extra text.\n"
     }
 }
 

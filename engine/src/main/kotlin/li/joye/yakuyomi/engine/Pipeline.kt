@@ -217,6 +217,108 @@ class Pipeline(
         )
     }
 
+    override suspend fun prepare(page: Bitmap): PrepareResult {
+        EngineTrace.log("pipe.prepare.enter ${page.width}x${page.height}")
+        val tDet = System.currentTimeMillis()
+        val detection = try {
+            detector.detect(page)
+        } catch (t: Throwable) {
+            Log.e(TAG, "detect failed", t)
+            return PrepareResult.Done(PageResult.Failed("detect: ${t.message}"))
+        }
+        val lines = detection.lines
+        val detectMs = System.currentTimeMillis() - tDet
+        if (lines.isEmpty()) {
+            return PrepareResult.Done(PageResult.Skipped("No text detected", PageStats(0, 0, 0, detectMs, 0, 0, 0, 0)))
+        }
+        val tOcr = System.currentTimeMillis()
+        try {
+            ocr.recognize(page, lines)
+        } catch (t: Throwable) {
+            Log.e(TAG, "OCR failed", t)
+            return PrepareResult.Done(PageResult.Failed("ocr: ${t.message}"))
+        }
+        val regions = Grouping.group(lines)
+        val ocrMs = System.currentTimeMillis() - tOcr
+        val textRegions = regions.filter { it.sourceText.isNotBlank() }
+        if (textRegions.isEmpty()) {
+            return PrepareResult.Done(
+                PageResult.Skipped("OCR found no text", PageStats(lines.size, regions.size, 0, detectMs, ocrMs, 0, 0, 0)),
+            )
+        }
+        val mask = MaskPacking.pack(detection.textMask)
+        EngineTrace.log("pipe.prepare.exit regions=${textRegions.size}")
+        return PrepareResult.Ready(
+            PreparedPage(page.width, page.height, textRegions, mask, lines.size, regions.size, detectMs, ocrMs),
+        )
+    }
+
+    override suspend fun translateBatch(pages: List<List<String>>): BatchTranslation {
+        val t0 = System.currentTimeMillis()
+        val tr = translator
+        if (tr == null) return BatchTranslation(pages.map { PageTranslation(it) }, 0, false) // debug: typeset source
+        val llm = tr as? LlmTranslator
+        if (llm != null) return llm.translatePages(pages)
+        val out = pages.map { q ->
+            try {
+                PageTranslation(tr.translate(q))
+            } catch (t: Throwable) {
+                PageTranslation(q, error = "${t.javaClass.simpleName}: ${t.message}")
+            }
+        }
+        val ms = System.currentTimeMillis() - t0
+        return BatchTranslation(out.map { it.copy(translateMs = ms) }, pages.size, false)
+    }
+
+    override suspend fun complete(page: Bitmap, prepared: PreparedPage, translation: PageTranslation): PageResult {
+        val tWall = System.currentTimeMillis()
+        if (page.width != prepared.width || page.height != prepared.height) {
+            return PageResult.Failed("Page changed size since it was analysed (${page.width}x${page.height})")
+        }
+        val textRegions = prepared.regions
+        textRegions.forEachIndexed { j, r -> r.translatedText = translation.translations.getOrElse(j) { r.sourceText } }
+        val kept = if (translator != null) TextFilter.apply(textRegions, cfg.translator.filterText) else textRegions
+        if (kept.isEmpty()) {
+            val aligned = textRegions.count { it.translatedText.isNotBlank() && it.translatedText != it.sourceText }
+            return if (translation.error != null) {
+                PageResult.Failed("No text translated (LLM failed: ${translation.error}) | response=${translation.raw?.take(80)}")
+            } else {
+                PageResult.Skipped(
+                    "No text kept (aligned $aligned/${textRegions.size}) | response=${translation.raw?.take(220)}",
+                    PageStats(
+                        prepared.lineCount, prepared.regionCount, 0, prepared.detectMs, prepared.ocrMs,
+                        translation.translateMs, 0, 0,
+                        promptTokens = translation.promptTokens, completionTokens = translation.completionTokens,
+                    ),
+                )
+            }
+        }
+        val textMask = MaskPacking.unpack(prepared.mask, prepared.width, prepared.height)
+        // Only the translated regions are inpainted: the failed ones keep their original artwork as they are.
+        val tInp = System.currentTimeMillis()
+        val cleaned = try {
+            inpainter.inpaint(page, kept, textMask)
+        } catch (t: Throwable) {
+            Log.e(TAG, "inpaint failed", t)
+            textMask.recycle()
+            return PageResult.Failed("inpaint: ${t.message}")
+        }
+        val inpaintMs = System.currentTimeMillis() - tInp
+        val tRn = System.currentTimeMillis()
+        val finalPage = Renderer.render(cleaned, kept, cfg.render, typeface)
+        val renderMs = System.currentTimeMillis() - tRn
+        if (finalPage !== cleaned && !cleaned.isRecycled) cleaned.recycle()
+        return PageResult.Translated(
+            finalPage,
+            PageStats(
+                prepared.lineCount, prepared.regionCount, kept.size, prepared.detectMs, prepared.ocrMs,
+                translation.translateMs, inpaintMs, renderMs,
+                System.currentTimeMillis() - tWall, translation.promptTokens, translation.completionTokens,
+            ),
+            PageAnalysis(textMask, kept),
+        )
+    }
+
     /**
      * 單緒暖機：對 detector / OCR / 去字三個原生 session 各空跑一次推論，完成首次 lazy 初始化。
      * 建構後、放行跨頁併發前呼叫一次（見介面說明）。三者依序（單緒），best-effort（各自 catch）。
