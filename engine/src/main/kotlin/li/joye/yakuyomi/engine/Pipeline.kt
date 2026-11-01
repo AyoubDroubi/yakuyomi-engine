@@ -229,6 +229,7 @@ class Pipeline(
         val lines = detection.lines
         val detectMs = System.currentTimeMillis() - tDet
         if (lines.isEmpty()) {
+            detection.textMask.recycle()
             return PrepareResult.Done(PageResult.Skipped("No text detected", PageStats(0, 0, 0, detectMs, 0, 0, 0, 0)))
         }
         val tOcr = System.currentTimeMillis()
@@ -236,17 +237,24 @@ class Pipeline(
             ocr.recognize(page, lines)
         } catch (t: Throwable) {
             Log.e(TAG, "OCR failed", t)
+            detection.textMask.recycle()
             return PrepareResult.Done(PageResult.Failed("ocr: ${t.message}"))
         }
         val regions = Grouping.group(lines)
         val ocrMs = System.currentTimeMillis() - tOcr
         val textRegions = regions.filter { it.sourceText.isNotBlank() }
         if (textRegions.isEmpty()) {
+            detection.textMask.recycle()
             return PrepareResult.Done(
                 PageResult.Skipped("OCR found no text", PageStats(lines.size, regions.size, 0, detectMs, ocrMs, 0, 0, 0)),
             )
         }
-        val mask = MaskPacking.pack(detection.textMask)
+        // Keep the mask as bits and free the full-page bitmap now: prepared pages wait for their batch.
+        val mask = try {
+            MaskPacking.pack(detection.textMask)
+        } finally {
+            detection.textMask.recycle()
+        }
         EngineTrace.log("pipe.prepare.exit regions=${textRegions.size}")
         return PrepareResult.Ready(
             PreparedPage(page.width, page.height, textRegions, mask, lines.size, regions.size, detectMs, ocrMs),
@@ -267,7 +275,7 @@ class Pipeline(
             }
         }
         val ms = System.currentTimeMillis() - t0
-        return BatchTranslation(out.map { it.copy(translateMs = ms) }, pages.size, false)
+        return BatchTranslation(out.map { it.copy(translateMs = ms) }, pages.size, false, failed = out.any { it.error != null })
     }
 
     override suspend fun complete(page: Bitmap, prepared: PreparedPage, translation: PageTranslation): PageResult {

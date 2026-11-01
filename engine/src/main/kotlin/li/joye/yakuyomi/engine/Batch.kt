@@ -19,8 +19,8 @@ class PreparedPage internal constructor(
     val height: Int,
     /** Regions with OCR text, in reading order; their [TextRegion.sourceText] are the lines to translate. */
     val regions: List<TextRegion>,
-    /** Detection text mask, one byte per pixel (0..255), [width]×[height] row-major. */
-    internal val mask: ByteArray,
+    /** Detection text mask (binary), one bit per pixel, [width]×[height] row-major (see [MaskPacking]). */
+    internal val mask: LongArray,
     internal val lineCount: Int,
     internal val regionCount: Int,
     internal val detectMs: Long,
@@ -33,7 +33,7 @@ class PreparedPage internal constructor(
     val textLength: Int get() = regions.sumOf { it.sourceText.length }
 
     /** Memory held by this object, roughly (the mask dominates). */
-    val approxBytes: Long get() = mask.size.toLong()
+    val approxBytes: Long get() = mask.size.toLong() * 8
 }
 
 sealed interface PrepareResult {
@@ -51,7 +51,7 @@ data class PageTranslation(
     /** Non-null when the request failed or some of this page's lines were missing from the answer. */
     val error: String? = null,
     val raw: String? = null,
-    /** Token usage of the whole request is reported on the first page of the batch only. */
+    /** Token usage: 0 for batch pages (the batch reports it once, [BatchTranslation]); set for single-page calls. */
     val promptTokens: Int = 0,
     val completionTokens: Int = 0,
     val translateMs: Long = 0,
@@ -64,28 +64,60 @@ data class BatchTranslation(
     val requests: Int,
     /** True when the first answer missed lines (the caller can shrink later batches). */
     val hadMissingLines: Boolean,
+    /** True when the request itself failed (network, timeout, rate limit): every page carries the error. */
+    val failed: Boolean = false,
+    /** Token usage of the whole batch (all its requests). */
+    val promptTokens: Int = 0,
+    val completionTokens: Int = 0,
 )
 
+/**
+ * The detection text mask is binary (the detector writes only white or black), so prepared pages keep it as one bit
+ * per pixel: a 10 MP page costs 1.25 MB instead of 40 MB as a bitmap.
+ */
 internal object MaskPacking {
-    /** ARGB mask bitmap → one byte per pixel (blue channel, the one the inpainter reads). */
-    fun pack(mask: Bitmap): ByteArray {
+    /** ARGB mask bitmap → bits (set = text; blue channel > 127, the test the inpainter uses). */
+    fun pack(mask: Bitmap): LongArray {
         val w = mask.width
         val h = mask.height
-        val px = IntArray(w * h)
-        mask.getPixels(px, 0, w, 0, 0, w, h)
-        return packPixels(px)
+        val out = LongArray((w * h + 63) / 64)
+        val row = IntArray(w)
+        for (y in 0 until h) {
+            mask.getPixels(row, 0, w, 0, y, w, 1)
+            val base = y * w
+            for (x in 0 until w) if ((row[x] and 0xFF) > 127) setBit(out, base + x)
+        }
+        return out
     }
 
-    fun packPixels(px: IntArray): ByteArray = ByteArray(px.size) { (px[it] and 0xFF).toByte() }
-
-    fun unpackPixels(bytes: ByteArray): IntArray = IntArray(bytes.size) {
-        val v = bytes[it].toInt() and 0xFF
-        (0xFF shl 24) or (v shl 16) or (v shl 8) or v
+    fun packPixels(px: IntArray): LongArray {
+        val out = LongArray((px.size + 63) / 64)
+        for (i in px.indices) if ((px[i] and 0xFF) > 127) setBit(out, i)
+        return out
     }
 
-    fun unpack(bytes: ByteArray, w: Int, h: Int): Bitmap {
+    fun unpackPixels(bits: LongArray, size: Int): IntArray = IntArray(size) {
+        if ((bits[it ushr 6] ushr (it and 63)) and 1L != 0L) WHITE else BLACK
+    }
+
+    fun unpack(bits: LongArray, w: Int, h: Int): Bitmap {
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
-        bmp.setPixels(unpackPixels(bytes), 0, w, 0, 0, w, h)
+        val row = IntArray(w)
+        for (y in 0 until h) {
+            val base = y * w
+            for (x in 0 until w) {
+                val i = base + x
+                row[x] = if ((bits[i ushr 6] ushr (i and 63)) and 1L != 0L) WHITE else BLACK
+            }
+            bmp.setPixels(row, 0, w, 0, y, w, 1)
+        }
         return bmp
     }
+
+    private fun setBit(bits: LongArray, i: Int) {
+        bits[i ushr 6] = bits[i ushr 6] or (1L shl (i and 63))
+    }
+
+    private const val WHITE = -0x1 // 0xFFFFFFFF
+    private const val BLACK = -0x1000000 // 0xFF000000
 }

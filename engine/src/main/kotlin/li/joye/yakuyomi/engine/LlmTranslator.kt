@@ -95,7 +95,12 @@ class LlmTranslator(
             Log.e(TAG, "Batch of ${pages.size} pages failed: ${t.message}", t)
             val err = "${t.javaClass.simpleName}: ${t.message}"
             val ms = System.currentTimeMillis() - t0
-            return BatchTranslation(pages.map { PageTranslation(it, error = err, translateMs = ms) }, 1, false)
+            return BatchTranslation(
+                pages.map { PageTranslation(it, error = err, translateMs = ms) },
+                requests = 1,
+                hadMissingLines = false,
+                failed = true,
+            )
         }
         val ms = System.currentTimeMillis() - t0
         val all = core.translations(flat)
@@ -108,12 +113,16 @@ class LlmTranslator(
                 translations = idx.map { all[it] },
                 error = if (answered < lines.size) "Parsed $answered/${lines.size} lines" else null,
                 raw = core.raw.take(220),
-                promptTokens = if (p == 0) core.usage?.promptTokens ?: 0 else 0,
-                completionTokens = if (p == 0) core.usage?.completionTokens ?: 0 else 0,
                 translateMs = ms,
             )
         }
-        return BatchTranslation(out, core.requests, core.hadMissing)
+        return BatchTranslation(
+            out,
+            requests = core.requests,
+            hadMissingLines = core.hadMissing,
+            promptTokens = core.usage?.promptTokens ?: 0,
+            completionTokens = core.usage?.completionTokens ?: 0,
+        )
     }
 
     /** Parsed answer of one [translateLines] call (1-based line numbers). */
@@ -384,8 +393,8 @@ class LlmTranslator(
         private const val SYSTEM_TEMPLATE =
             "You are a professional translator of manga, manhwa and webtoons. Translate the numbered lines " +
                 "{from_lang}into {to_lang}.\n" +
-                "The lines are speech bubbles and captions from consecutive comic pages, in reading order; use the " +
-                "surrounding lines as context.\n" +
+                "The lines are speech bubbles and captions from a comic (one or more consecutive pages), in reading " +
+                "order; use the surrounding lines as context.\n" +
                 "Rules:\n" +
                 "- Output exactly one line for every input line, in the same order, each starting with its prefix in the " +
                 "exact <|number|> format followed only by the translation. Never skip, merge, split or leave a line empty.\n" +
