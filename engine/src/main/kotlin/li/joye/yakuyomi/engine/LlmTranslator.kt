@@ -68,9 +68,26 @@ class LlmTranslator(
     suspend fun translateDetailed(queries: List<String>): TranslateResult {
         if (queries.isEmpty()) return TranslateResult(emptyList())
         return try {
-            val (raw, usage) = request(buildMessages(queries))
-            val parsed = parse(raw)
-            val error = if (parsed.size < queries.size) "解析${parsed.size}/${queries.size}" else null
+            val (raw, firstUsage) = request(buildMessages(queries))
+            val parsed = parse(raw).toMutableMap()
+            var usage = firstUsage
+            // Lines the model skipped or left empty get one more request with just those lines, so a dropped line
+            // does not leave its bubble untranslated. A used-up daily quota during that request fails the whole page
+            // (it is retried later) instead of keeping a page with a hole in it; other errors keep the first answer.
+            val missing = queries.indices.filter { parsed[it + 1].isNullOrBlank() }
+            if (missing.isNotEmpty()) {
+                try {
+                    val (raw2, usage2) = request(buildMessages(missing.map { queries[it] }))
+                    val again = parse(raw2)
+                    missing.forEachIndexed { k, i -> again[k + 1]?.takeIf { it.isNotBlank() }?.let { parsed[i + 1] = it } }
+                    usage = sumUsage(usage, usage2)
+                } catch (t: Throwable) {
+                    if (t.message?.contains(DAILY_QUOTA_MESSAGE) == true) throw t
+                    Log.w(TAG, "Retry of ${missing.size} missing lines failed: ${t.message}")
+                }
+            }
+            val got = queries.indices.count { !parsed[it + 1].isNullOrBlank() }
+            val error = if (got < queries.size) "Parsed $got/${queries.size} lines" else null
             val translations = queries.mapIndexed { i, q ->
                 val tr = parsed[i + 1]?.takeIf { it.isNotBlank() }
                 if (tr != null) (postProcess?.invoke(tr) ?: tr) else q
@@ -91,6 +108,12 @@ class LlmTranslator(
         lastRaw = r.raw
         lastError = r.error
         return r.translations
+    }
+
+    private fun sumUsage(a: Usage?, b: Usage?): Usage? = when {
+        a == null -> b
+        b == null -> a
+        else -> Usage(a.promptTokens + b.promptTokens, a.completionTokens + b.completionTokens)
     }
 
     private fun buildMessages(queries: List<String>): JSONArray {
@@ -151,7 +174,7 @@ class LlmTranslator(
             } catch (e: RateLimitedException) {
                 attempt++
                 if (e.daily) {
-                    throw RuntimeException("Daily quota for this model is used up (it resets once a day). ${e.message}", e)
+                    throw RuntimeException("$DAILY_QUOTA_MESSAGE (it resets once a day). ${e.message}", e)
                 }
                 if (attempt >= MAX_RATE_RETRIES) {
                     throw RuntimeException("Still rate-limited after $attempt tries. ${e.message}", e)
@@ -276,6 +299,9 @@ class LlmTranslator(
         private val WS_RE = Regex("""\s+""")
         /** Gemini names the exhausted quota, e.g. "GenerateRequestsPerDayPerProjectPerModel-FreeTier". */
         private val DAILY_QUOTA_RE = Regex("""(?i)per\s*day""")
+
+        /** Start of the error for a used-up daily quota; the app matches on it to pause its queue. */
+        const val DAILY_QUOTA_MESSAGE = "Daily quota for this model is used up"
         private val RETRY_DELAY_RE = Regex(""""retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"""")
 
         /** Wait the provider asked for: `Retry-After` seconds, else Gemini's `retryDelay` in the body; null = unknown. */
@@ -312,6 +338,10 @@ class LlmTranslator(
                 "- Translate line by line, maintaining accuracy and the authentic; Faithfully reproducing the original text and emotional intent.\n" +
                 "- Preserve original gibberish or sound effects without translation.\n" +
                 "- Output each segment with its prefix (<|number|> format exactly) and only provide the translation without raw text.\n" +
+                "- Output exactly one line for every input line, in the same order. Never skip, merge or leave a line empty.\n" +
+                "- Consecutive lines may be fragments of one sentence split across speech bubbles; translate each fragment so " +
+                "that, read in order, the fragments form one natural sentence.\n" +
+                "- The text comes from OCR and may contain misread characters (for example 4 for Y); translate what was meant.\n" +
                 "- Translate content only—no additional interpretation or commentary.\n" +
                 "Translate the following {from_lang}text into {to_lang}:\n"
     }

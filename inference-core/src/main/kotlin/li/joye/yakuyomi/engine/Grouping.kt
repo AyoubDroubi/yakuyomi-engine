@@ -45,13 +45,49 @@ class TextRegion(
     var dbgStd: Float = -1f
     var dbgWhite: Float = -1f
 
-    /** 合併原文（lines 已依閱讀序排好）。日文無空白，直接相接。 */
-    val sourceText: String get() = lines.joinToString("") { it.text }
+    /** Region source text: lines in reading order, joined by [joinOcrLines] (no space between CJK lines, a space otherwise). */
+    val sourceText: String get() = joinOcrLines(lines.map { it.text })
 
     val x0: Float = lines.minOf { ln -> ln.quad.minOf { it.x } }
     val y0: Float = lines.minOf { ln -> ln.quad.minOf { it.y } }
     val x1: Float = lines.maxOf { ln -> ln.quad.maxOf { it.x } }
     val y1: Float = lines.maxOf { ln -> ln.quad.maxOf { it.y } }
+}
+
+/**
+ * Join the OCR lines of one region. Chinese and Japanese are written without spaces, so their lines are concatenated;
+ * every other script (English, Korean, ...) needs a space at the line break, otherwise "IT WOULD BE A" + "WASTE"
+ * reaches the translator as "AWASTE". A line ending in a hyphen after a letter is a word split across lines and is
+ * joined without a space. Blank lines (dropped low-confidence OCR) are skipped.
+ */
+fun joinOcrLines(parts: List<String>): String {
+    val sb = StringBuilder()
+    for (raw in parts) {
+        val part = raw.trim()
+        if (part.isEmpty()) continue
+        if (sb.isNotEmpty() && needsSpaceBetween(sb, part[0])) sb.append(' ')
+        sb.append(part)
+    }
+    return sb.toString()
+}
+
+private fun needsSpaceBetween(before: CharSequence, next: Char): Boolean {
+    val last = before[before.length - 1]
+    if (isNoSpaceScript(last) || isNoSpaceScript(next)) return false
+    if (last == '-' && before.length >= 2 && before[before.length - 2].isLetter()) return false
+    return true
+}
+
+/** Scripts written without spaces between words (Han, kana) and their full-width punctuation. */
+private fun isNoSpaceScript(c: Char): Boolean {
+    if (c in '\u3000'..'\u303F' || c in '\uFF00'..'\uFFEF' || c in '\u30FB'..'\u30FC') return true
+    return when (Character.UnicodeScript.of(c.code)) {
+        Character.UnicodeScript.HAN,
+        Character.UnicodeScript.HIRAGANA,
+        Character.UnicodeScript.KATAKANA,
+        -> true
+        else -> false
+    }
 }
 
 object Grouping {

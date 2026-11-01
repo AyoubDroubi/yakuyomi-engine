@@ -53,7 +53,9 @@ data class PageStats(
  *
  * **§11 不變式焊進此處：永不用比原圖更糟的東西覆蓋。**
  *   - 偵測不到字 / OCR 全空 / 譯文全失敗 → [PageResult.Skipped]（保留原圖、不覆蓋；去字若已並發跑出來也丟棄）。
- *   - 單 block 翻譯失敗 → **去字後重貼 OCR 原文**（日文）——非「保留源圖」。讓去字不必等翻譯 ⇒ 去字(CPU)與翻譯(網路)並發重疊。
+ *   - A single bubble whose translation failed keeps its original artwork: inpainting still runs on every region in
+ *     parallel with translation, and afterwards the original pixels around the failed bubbles are copied back
+ *     (see [OriginalRestore]). Re-pasting the OCR text instead showed OCR misreads ("DO4OU THIN") in a plain font.
  *   - 任一階段拋例外（網路/429 重試後仍失敗等）→ [PageResult.Failed]（保留原圖、不覆蓋、可重試；丟棄已並發的去字）。
  *
  * **去字‖翻譯重疊**：兩者只依賴 OCR、互不爭資源（網路 vs CPU）⇒ 同時跑，[PageStats.wallMs] < [PageStats.totalMs]（省下重疊掉的）。
@@ -176,9 +178,9 @@ class Pipeline(
                 )
             }
         }
-        // 失敗的區（不在 kept）→ 譯文改回原文＝去字後重貼 OCR 日文（TextRegion 無 equals override→HashSet 走 identity）。
+        // Regions whose translation failed (not in kept; TextRegion has identity equality) keep the original artwork.
         val keptSet = kept.toHashSet()
-        textRegions.forEach { if (it !in keptSet) it.translatedText = it.sourceText }
+        val failed = textRegions.filter { it !in keptSet }
 
         // 等去字完成（多半已與翻譯重疊跑完）
         EngineTrace.log("pipe.inpaint.await")
@@ -188,10 +190,15 @@ class Pipeline(
             Log.e(TAG, "去字失敗", t); return@coroutineScope PageResult.Failed("inpaint: ${t.message}")
         }
 
-        // 排版（全 textRegions：kept 貼譯文、失敗區貼原文）
+        if (failed.isNotEmpty()) {
+            val margin = cfg.inpainter.bboxPad + (cfg.inpainter.maskDilate / 2f).toInt() + 2
+            OriginalRestore.restore(cleaned, page, failed.map { it.rect(margin) }, kept.map { it.rect(margin) })
+        }
+
+        // Typeset only the translated regions; failed ones show the original artwork restored above.
         val tRn = System.currentTimeMillis()
         EngineTrace.log("pipe.render.enter")
-        val finalPage = Renderer.render(cleaned, textRegions, cfg.render, typeface)
+        val finalPage = Renderer.render(cleaned, kept, cfg.render, typeface)
         val renderMs = System.currentTimeMillis() - tRn
         EngineTrace.log("pipe.page.done")
 
@@ -201,7 +208,9 @@ class Pipeline(
                 lines.size, regions.size, kept.size, detectMs, ocrMs, translateMs, inpaintMs, renderMs,
                 System.currentTimeMillis() - tWall, promptTok, completionTok,
             ),
-            PageAnalysis(detection.textMask, textRegions),
+            // Materials (re-render with another inpaint method, night boxes) only cover the translated regions,
+            // so a re-render keeps the original artwork of the failed ones too.
+            PageAnalysis(detection.textMask, kept),
         )
     }
 
